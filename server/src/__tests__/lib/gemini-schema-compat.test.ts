@@ -252,3 +252,67 @@ describe('sanitizeForGemini vendor extensions and pass-through', () => {
     expect(JSON.stringify(sanitizeForGemini(input))).toBe(JSON.stringify(input));
   });
 });
+
+describe('sanitizeForGemini items shapes (#1334)', () => {
+  it('collapses a tuple items array into anyOf over its members', () => {
+    // Claude Code sends JSON Schema tuple arrays in tool parameters; Gemini's
+    // Schema proto has a single `items` message and 400s on the list.
+    const out = sanitizeForGemini({
+      type: 'array',
+      items: [{ type: 'string' }, { type: 'integer' }],
+    }) as Record<string, unknown>;
+    expect(out.items).toEqual({ anyOf: [{ type: 'string' }, { type: 'integer' }] });
+  });
+
+  it('unwraps a single-member tuple and keeps its keywords', () => {
+    const out = sanitizeForGemini({
+      type: 'array',
+      items: [{ type: 'string', enum: ['a', 'b'] }],
+    }) as Record<string, unknown>;
+    expect(out.items).toEqual({ type: 'string', enum: ['a', 'b'] });
+  });
+
+  it('drops items when the tuple has no schema members', () => {
+    const out = sanitizeForGemini({ type: 'array', items: [null, 'nope'] }) as Record<string, unknown>;
+    expect('items' in out).toBe(false);
+  });
+
+  it('drops an items object that sanitizes to {} (the items.items missing-field shape)', () => {
+    // A `{}` struct under `items` is what Gemini reports as
+    // "...items.items: missing field"; omitting items is valid instead.
+    const out = sanitizeForGemini({
+      type: 'object',
+      properties: {
+        where: { type: 'array', items: {} },
+        nested: { type: 'array', items: { items: {} } },
+      },
+    }) as any;
+    expect(out.properties.where).toEqual({ type: 'array' });
+    expect(out.properties.nested).toEqual({ type: 'array' });
+  });
+
+  it('drops boolean and null items (JSON Schema draft-6+ boolean schemas)', () => {
+    expect('items' in (sanitizeForGemini({ type: 'array', items: true }) as object)).toBe(false);
+    expect('items' in (sanitizeForGemini({ type: 'array', items: null }) as object)).toBe(false);
+  });
+
+  it('keeps a normal single-schema items untouched', () => {
+    const input = { type: 'array', items: { type: 'string', description: 'tag' } };
+    expect(JSON.stringify(sanitizeForGemini(input))).toBe(JSON.stringify(input));
+  });
+
+  it('sanitizes a nested tuple inside properties (the #1334 Claude Code shape)', () => {
+    const out = sanitizeForGemini({
+      type: 'object',
+      properties: {
+        query: {
+          type: 'object',
+          properties: {
+            where: { type: 'array', items: [{ items: {} }] },
+          },
+        },
+      },
+    }) as any;
+    expect(out.properties.query.properties.where).toEqual({ type: 'array' });
+  });
+});
