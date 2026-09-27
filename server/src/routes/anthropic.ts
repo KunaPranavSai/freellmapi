@@ -24,6 +24,7 @@ import { extractApiToken, timingSafeStringEqual, getStickyModel, setStickyModel 
 import { runFallbackLoop, newFallbackState, fallbackRoutingTokens, recordUpstreamSuccess, type ExhaustionBody, setFallbackHeaders, setExhaustionHeaders, type AttemptRecord, type FallbackState } from '../lib/fallback-loop.js';
 import { routedViaValue } from '../lib/header-value.js';
 import { applyTokenBudget, tokenBudgetMessage } from '../lib/guardrails.js';
+import { normalizeIdempotencyKey, hashIdempotencyKey, computeIdempotencyFingerprint, lookupIdempotencyReplay, storeIdempotencyResult } from '../services/idempotency.js';
 import { resolveAnthropicModel, claudeFamilyDiscoveryEntries } from '../services/anthropic-map.js';
 import { isUnifyEnabled, getModelGroups, resolveRequestedIdForDispatch } from '../services/model-groups.js';
 import type { ReasoningEffort } from '../lib/sampling-params.js';
@@ -483,6 +484,45 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
   }
   let { messages } = converted;
   const { tools, tool_choice, hasImage, wantsTools } = converted;
+
+  // ── Idempotency-Key (services/idempotency.ts) ──
+  // Same caller-scoped retry dedup /v1/chat/completions has: Claude Code and
+  // the Anthropic SDKs retry a timed-out request with the same
+  // Idempotency-Key, and each attempt used to burn another free-tier slot for
+  // an answer already produced. A completed response for the same key +
+  // request fingerprint replays at zero provider cost; the same key with
+  // different content is a 409. Streaming bypasses (a stream cannot be
+  // replayed as a unit). Fingerprint is computed on the translated chat
+  // messages BEFORE compression so a retry with identical wire content always
+  // hashes identically.
+  const idemKeyRaw = req.headers['idempotency-key'] ?? req.headers['Idempotency-Key'];
+  const idemKey = !stream ? normalizeIdempotencyKey(idemKeyRaw) : null;
+  const idemFingerprint = idemKey
+    ? computeIdempotencyFingerprint({
+        model: requestedModel,
+        messages,
+        temperature,
+        top_p,
+        max_tokens: clientMaxTokens,
+        tools,
+        tool_choice,
+      })
+    : null;
+  if (idemKey && idemFingerprint) {
+    const keyHash = hashIdempotencyKey(idemKey);
+    const claim = lookupIdempotencyReplay(keyHash, idemFingerprint);
+    if (claim.kind === 'replay') {
+      res.setHeader('X-Routed-Via', 'idempotency');
+      res.status(claim.status).json(claim.body);
+      return;
+    }
+    if (claim.kind === 'conflict') {
+      sendError(res, 409, 'invalid_request_error', 'idempotency_key_conflict');
+      return;
+    }
+    // kind === 'miss': proceed and persist on success below.
+  }
+
   // Downscale over-threshold inline images before compression/estimation so
   // the budget, routing, and upstream transfer all see the shrunk bytes
   // (see lib/image-normalize.ts). The cache-control detection below reads the
@@ -763,6 +803,16 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
       res.setHeader('X-Routed-Via', routedViaValue(route.platform, route.modelId));
       setFallbackHeaders(res, attempt, attemptLog);
       logRequest(route.platform, route.modelId, route.keyId, 'success', promptTokens, completionTokens, Date.now() - start, null, null, pinnedModelId, null, 'http');
+      // Persist for Idempotency-Key replays. A `max_tokens` truncation is a
+      // partial answer; replaying it as final would be worse than regenerating
+      // (same policy as /v1/chat/completions and the response cache).
+      if (
+        idemKey
+        && idemFingerprint
+        && result.choices?.[0]?.finish_reason !== 'length'
+      ) {
+        storeIdempotencyResult(hashIdempotencyKey(idemKey), idemFingerprint, 200, anthropicResponse);
+      }
       res.json(anthropicResponse);
       return 'done';
     },

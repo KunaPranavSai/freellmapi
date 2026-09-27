@@ -189,6 +189,63 @@ describe('Anthropic-compatible /v1/messages', () => {
     expect(headers.get('x-routed-via')).toMatch(/^groq\//);
   });
 
+  describe('Idempotency-Key', () => {
+    const base = { model: 'claude-3-5-sonnet-20241022', max_tokens: 64, messages: [{ role: 'user', content: 'idem probe' }] };
+    const headers = () => ({ ...anthropicHeaders(), 'Idempotency-Key': 'idem-' + Math.random().toString(36).slice(2) });
+
+    it('replays a completed response for a retried key without touching the provider', async () => {
+      // Claude Code retries a timed-out request with the same Idempotency-Key;
+      // the retry must not burn a second free-tier slot.
+      const key = headers()['Idempotency-Key'];
+      const captured = mockJson(textCompletion('first answer'));
+      const first = await request(app, '/v1/messages', base, { ...anthropicHeaders(), 'Idempotency-Key': key });
+      expect(first.status).toBe(200);
+      expect(captured.body).not.toBeNull();
+
+      // A second fetch would capture a provider call; the replay must make none.
+      const spy = mockJson(textCompletion('MUST NOT BE CALLED'));
+      const second = await request(app, '/v1/messages', base, { ...anthropicHeaders(), 'Idempotency-Key': key });
+      expect(second.status).toBe(200);
+      expect(second.headers.get('x-routed-via')).toBe('idempotency');
+      expect(second.body.content).toEqual([{ type: 'text', text: 'first answer' }]);
+      expect(second.body.id).toBe(first.body.id); // verbatim replay of the original envelope
+      expect(spy.body).toBeNull();
+    });
+
+    it('rejects reuse of the same key with different content (409 conflict)', async () => {
+      const key = headers()['Idempotency-Key'];
+      mockJson(textCompletion('cached'));
+      const first = await request(app, '/v1/messages', base, { ...anthropicHeaders(), 'Idempotency-Key': key });
+      expect(first.status).toBe(200);
+
+      const conflict = await request(app, '/v1/messages',
+        { ...base, messages: [{ role: 'user', content: 'DIFFERENT prompt' }] },
+        { ...anthropicHeaders(), 'Idempotency-Key': key });
+      expect(conflict.status).toBe(409);
+      expect(conflict.body.error.message).toBe('idempotency_key_conflict');
+    });
+
+    it('bypasses idempotency for streaming requests', async () => {
+      const key = headers()['Idempotency-Key'];
+      const chunk = (delta: any, finish: string | null = null) => ({ id: 'c1', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [{ index: 0, delta, finish_reason: finish }] });
+      mockStream(sse(
+        chunk({ role: 'assistant' }),
+        chunk({ content: 'streamed' }),
+        chunk({}, 'stop'),
+        '[DONE]',
+      ));
+      const first = await request(app, '/v1/messages', { ...base, stream: true }, { ...anthropicHeaders(), 'Idempotency-Key': key });
+      expect(first.status).toBe(200);
+      expect(first.text).toContain('streamed');
+      const claims = getDb().prepare('SELECT COUNT(*) AS n FROM idempotency_claims WHERE request_fingerprint IS NOT NULL').get() as { n: number };
+      const before = claims.n;
+      const again = await request(app, '/v1/messages', { ...base, stream: true }, { ...anthropicHeaders(), 'Idempotency-Key': key });
+      expect(again.status).toBe(200);
+      const after = (getDb().prepare('SELECT COUNT(*) AS n FROM idempotency_claims WHERE request_fingerprint IS NOT NULL').get() as { n: number }).n;
+      expect(after).toBe(before); // no claim written for streams
+    });
+  });
+
   it('forwards the system prompt and tools, returns a tool_use block (stop_reason tool_use)', async () => {
     const captured = mockJson(toolCompletion('get_weather', '{"city":"Karachi"}'));
     const { status, body } = await request(app, '/v1/messages', {
